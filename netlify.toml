@@ -1,0 +1,19 @@
+[build]
+  publish = "."
+  command = "echo 'static site, nothing to build'"
+
+[functions]
+  directory = "netlify/functions"
+  node_bundler = "esbuild"
+
+# Keep the server code and config out of the public site.
+[[redirects]]
+  from = "/lib/*"
+  to = "/404"
+  status = 404
+  force = true
+[[redirects]]
+  from = "/netlify/*"
+  to = "/404"
+  status = 404
+  force = true
