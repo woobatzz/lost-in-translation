@@ -374,7 +374,20 @@ function setState(t,err){var n=$('state');n.textContent=t;n.classList.toggle('er
 
 /* ---------- transcript ---------- */
 var log=[];
-function addLog(line){log.push(line);var n=$('log');n.textContent=log.join('\n');n.scrollTop=n.scrollHeight;}
+function addLog(line){log.push(line);var n=$('log');n.textContent=log.join('\n');n.scrollTop=n.scrollHeight;remoteLog(line);}
+/* diagnostics go to the booth server log, so problems can be checked without screenshots */
+var rlBuf=[],rlTimer=null;
+function remoteLog(line){
+  if(!S.code||ownKeys())return;
+  rlBuf.push(new Date().toISOString().slice(11,19)+' '+line);
+  if(rlBuf.length>=60)flushLog();else if(!rlTimer)rlTimer=setTimeout(flushLog,4000);
+}
+function flushLog(){
+  clearTimeout(rlTimer);rlTimer=null;if(!rlBuf.length)return;
+  var lines=rlBuf.splice(0,rlBuf.length);
+  try{fetch('/api/log',{method:'POST',keepalive:true,headers:hostHeaders({'content-type':'application/json'}),body:JSON.stringify({lines:lines})}).catch(function(){});}catch(e){}
+}
+window.addEventListener('pagehide',flushLog);
 
 /* ---------- audio capture & phrase cutting ---------- */
 var stream=null,actx=null,src=null,proc=null,running=false,muted=false;
@@ -728,7 +741,10 @@ async function liveStart(){
   L.starting=true;unlockAudioOut();
   $('go').classList.add('on');$('goText').textContent='Connecting';setState('Connecting');
   try{
-    L.mic=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true,autoGainControl:true,channelCount:1}});
+    /* Table mode: call-style processing (echo cancelling) makes Android switch to the earpiece.
+       It is not needed here, because the mic sends silence while a translation plays. */
+    L.mic=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false,channelCount:1}});
+    try{var ts=L.mic.getAudioTracks()[0].getSettings();addLog('audio: mic echoCancellation='+ts.echoCancellation+' noiseSuppression='+ts.noiseSuppression+' autoGain='+ts.autoGainControl+' rate='+ts.sampleRate);}catch(e){}
   }catch(e){L.starting=false;$('go').classList.remove('on');$('goText').textContent='Start';setState('Microphone blocked. Allow it for this site in the browser settings, then tap Start',true);return;}
   try{
     var first=await liveTick(0);if(!first){L.starting=false;liveStop();return;}
@@ -808,7 +824,8 @@ function liveDecide(st){
   else if(Date.now()-st.utterStart>1200)st.allow=true;
   if(st.allow===null)return;
   liveVolume(st);
-  if(st.allow===false){addLog('  skipped repeat in '+st.lang+': '+st.pending.trim().slice(0,60));st.skipped=true;}
+  addLog('engine: '+st.lang+(st.allow?' kept translation':' skipped repeat')+' (heard: '+(inp?inp.slice(0,60):'nothing yet, timed out')+')');
+  if(st.allow===false)st.skipped=true;
 }
 
 function liveEvent(st,ev){
@@ -816,12 +833,14 @@ function liveEvent(st,ev){
   if(!L.seen[type]){L.seen[type]=1;addLog('  event: '+type);}
   if(type.indexOf('error')>-1){var em=(ev.error&&(ev.error.message||ev.error.code))||'unknown';addLog('  ✕ '+st.lang+': '+em);setState('Live translation error: '+em,true);return;}
   var delta=typeof ev.delta==='string'?ev.delta:(typeof ev.text==='string'&&type.indexOf('.done')<0?ev.text:'');
-  if(type.indexOf('input_transcript')>-1&&delta){
+  if(/input.*transcri/.test(type)&&delta){
+    if(!st.speechAt){st.speechAt=Date.now();}
     st.input+=delta;L.lastSpeech=Date.now();
     if(st.allow===null&&st.pending){liveDecide(st);liveShow(st);}
     return;
   }
-  if(type.indexOf('output_transcript')>-1&&delta){
+  if(/output.*transcri/.test(type)&&delta){
+    if(!st.firstOut){st.firstOut=Date.now();if(st.speechAt)addLog('latency: '+st.lang+' caption began '+(st.firstOut-st.speechAt)+' ms after speech was heard');}
     L.lastSpeech=Date.now();
     if(!st.utterStart)st.utterStart=Date.now();
     st.pending+=delta;st.lastDelta=Date.now();
@@ -840,7 +859,7 @@ function liveShow(st){
 }
 function liveFinalize(st){
   clearTimeout(st.decideTimer);
-  var was=st.cur;st.pending='';st.allow=null;st.utterStart=0;st.skipped=false;
+  var was=st.cur;st.pending='';st.allow=null;st.utterStart=0;st.skipped=false;st.speechAt=0;st.firstOut=0;
   /* let the delayed tail of the last translation finish before closing the gate */
   clearTimeout(st.gainHold);st.gainHold=setTimeout(function(){if(st.allow===null)liveVolume(st);},1500);
   if(!was){st.input='';return;}
@@ -888,6 +907,7 @@ function liveStop(msg){
   try{L.mic&&L.mic.getTracks().forEach(function(t){t.stop();});}catch(e){}L.mic=null;L.micAn=null;
   releaseWake();$('go').classList.remove('on');$('goText').textContent='Start';$('lvl').style.width='0';$('go').style.setProperty('--lvl','0');
   if(was)liveTick(0);
+  addLog('\u2022 live session ended'+(typeof msg==='string'?': '+msg:''));flushLog();
   if(typeof msg==='string')setState(msg,true);else setState('Stopped');
 }
 
