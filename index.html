@@ -816,16 +816,41 @@ function liveVolume(st){
   var want=st.allow===true&&(st.side==='b'?S.speakB:S.speakA)?1:0;
   try{st.gain.gain.setTargetAtTime(want,actx.currentTime,0.03);}catch(e){st.gain.gain.value=want;}
 }
+/* Echo of the booth's own voice: the mic hears the other stream's translation coming out of the speaker.
+   It is recognised by its words (it matches what the other stream just said) or by timing
+   (speech in the other stream's language while that stream is playing or just stopped). */
+function recentSaid(other){
+  var now=Date.now(),txt=other.pending||'';
+  (other.said||[]).forEach(function(x){if(now-x.t<15000)txt+=' '+x.text;});
+  return txt;
+}
+function isEcho(st,inp){
+  var other=L.streams[st.side==='a'?'b':'a'];if(!other||!inp)return false;
+  var tail=words(inp).slice(-14).join(' ');
+  if(words(tail).length>=2&&overlap(tail,recentSaid(other))>=0.35)return true;
+  var playing=other.lastAudible&&Date.now()-other.lastAudible<1500;
+  return !!(playing&&scriptOf(inp)&&scriptOf(inp)===SCRIPT_OF[other.lang]);
+}
 function liveDecide(st){
   if(st.allow!==null)return;
   var other=L.streams[st.side==='a'?'b':'a'];
   var inp=(st.input.trim()||(other?other.input.trim():''));
-  if(words(inp).length>=2)st.allow=!sameLanguage(st,inp);
-  else if(Date.now()-st.utterStart>1200)st.allow=true;
+  var why='';
+  if(words(inp).length>=2){
+    if(isEcho(st,inp)){st.allow=false;why='skipped echo of the booth\'s own voice';}
+    else{st.allow=!sameLanguage(st,inp);why=st.allow?'kept translation':'skipped repeat';}
+  }
+  else if(Date.now()-st.utterStart>1200){st.allow=true;why='kept translation';}
   if(st.allow===null)return;
   liveVolume(st);
-  addLog('engine: '+st.lang+(st.allow?' kept translation':' skipped repeat')+' (heard: '+(inp?inp.slice(0,60):'nothing yet, timed out')+')');
+  addLog('engine: '+st.lang+' '+why+' (heard: '+(inp?inp.slice(0,60):'nothing yet, timed out')+')');
   if(st.allow===false)st.skipped=true;
+}
+/* an allowed phrase can turn into an echo half way through: stop it as soon as that shows */
+function liveRecheck(st){
+  if(st.allow!==true)return;
+  if(isEcho(st,st.input)){st.allow=false;liveVolume(st);addLog('engine: '+st.lang+' stopped mid-phrase, echo of the booth\'s own voice (heard: '+st.input.trim().slice(-60)+')');
+    if(st.cur){var i=feed[st.side].indexOf(st.cur);if(i>-1&&!st.cur.text.trim())feed[st.side].splice(i,1);st.cur.live=false;renderPane(st.side);}}
 }
 
 function liveEvent(st,ev){
@@ -837,6 +862,7 @@ function liveEvent(st,ev){
     if(!st.speechAt){st.speechAt=Date.now();}
     st.input+=delta;L.lastSpeech=Date.now();
     if(st.allow===null&&st.pending){liveDecide(st);liveShow(st);}
+    else liveRecheck(st);
     return;
   }
   if(/output.*transcri/.test(type)&&delta){
@@ -864,7 +890,7 @@ function liveFinalize(st){
   clearTimeout(st.gainHold);st.gainHold=setTimeout(function(){if(st.allow===null)liveVolume(st);},1500);
   if(!was){st.input='';return;}
   var t=st.cur.text.trim();
-  if(t){addLog('['+(st.side==='a'?S.B:S.A)+' > '+st.lang+'] '+(st.cur.orig||'(heard)')+'\n    '+t);recent.push((st.cur.orig||'')+' => '+t);if(recent.length>8)recent.shift();}
+  if(t){st.said=(st.said||[]).concat([{t:Date.now(),text:t}]).slice(-6);addLog('['+(st.side==='a'?S.B:S.A)+' > '+st.lang+'] '+(st.cur.orig||'(heard)')+'\n    '+t);recent.push((st.cur.orig||'')+' => '+t);if(recent.length>8)recent.shift();}
   st.cur.live=false;var fs=st.side;st.cur=null;st.input='';renderPane(fs);
   var other=L.streams[st.side==='a'?'b':'a'];if(other&&!other.cur)other.input='';
 }
@@ -877,12 +903,11 @@ function liveGate(){
   ['a','b'].forEach(function(k){
     var st=L.streams[k];if(!st||!st.analyser||(!st.gain&&(!st.audio||st.audio.muted)))return;
     st.analyser.getByteTimeDomainData(gateBuf);var s=0;for(var i=0;i<gateBuf.length;i++){var v=(gateBuf[i]-128)/128;s+=v*v;}
-    if(Math.sqrt(s/gateBuf.length)>0.02)loud=true;
+    if(Math.sqrt(s/gateBuf.length)>0.02){loud=true;st.lastAudible=Date.now();}
   });
+  /* The mic stays open so nobody's words are lost while a translation plays.
+     Echo of the booth's voice is filtered by liveDecide/liveRecheck instead. */
   var now=Date.now();if(loud)gateUntil=now+350;
-  var open=now>gateUntil;
-  ['a','b'].forEach(function(k){var st=L.streams[k];if(st&&st.track&&st.track.enabled!==open)st.track.enabled=open;});
-  if(!open)setState('Speaking');else if($('state').textContent==='Speaking')setState('Listening');
   /* level meter from the mic itself */
   if(L.micAn){L.micAn.getByteTimeDomainData(gateBuf);var m=0;for(var j=0;j<gateBuf.length;j++){var w=(gateBuf[j]-128)/128;m+=w*w;}meter(Math.sqrt(m/gateBuf.length),0.01);}
 }
