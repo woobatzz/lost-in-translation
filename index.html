@@ -230,6 +230,11 @@ dialog::backdrop{background:rgba(20,24,40,.55)}
 
       <section>
         <h3 class="lab">Translator</h3>
+        <div class="field" style="margin-bottom:12px"><label for="engine">Engine</label><select id="engine">
+          <option value="live">Live: translates while you talk, natural voice</option>
+          <option value="classic">Classic: phrase by phrase, cheaper</option>
+        </select></div>
+        <p class="hint" style="margin:-4px 0 12px">Live works with an access code. The model below is only used by Classic.</p>
         <div class="field"><select id="model" aria-label="Translator model">
           <option value="claude-haiku-5-5">Fastest (Haiku)</option>
           <option value="claude-sonnet-5-5">More careful (Sonnet)</option>
@@ -272,7 +277,7 @@ function ui(c,k){return (UI[c]||UI.en)[k];}
 function lname(c){return LANGS[c]||String(c||'?').toUpperCase();}
 
 /* ---------- settings ---------- */
-var S={code:'',device:'',openai:'',anthropic:'',A:'en',B:'ru',facing:true,silent:['es','it','fr','pt','pl','ro'],speakA:false,speakB:true,sens:6,pause:800,model:'claude-haiku-5-5',orig:true};
+var S={code:'',device:'',openai:'',anthropic:'',A:'en',B:'ru',facing:true,silent:['es','it','fr','pt','pl','ro'],speakA:false,speakB:true,sens:6,pause:800,model:'claude-haiku-5-5',orig:true,engine:'live'};
 try{var saved=JSON.parse(localStorage.getItem('twb.v2')||'null');if(saved)Object.keys(S).forEach(function(k){if(saved[k]!==undefined)S[k]=saved[k];});}catch(e){}
 function save(){try{localStorage.setItem('twb.v2',JSON.stringify(S));}catch(e){}}
 /* invite links look like https://site/?code=FAMILIA ; the code is kept on this phone and removed from the address bar */
@@ -284,7 +289,7 @@ function save(){try{localStorage.setItem('twb.v2',JSON.stringify(S));}catch(e){}
   if(!S.device){S.device=Math.random().toString(36).slice(2,10)+Date.now().toString(36);}
   save();
 })();
-function ownKeys(){return !!(S.openai&&S.anthropic);}
+function ownKeys(){return !!(S.openai&&S.anthropic)&&!S.code;}
 function ready(){return ownKeys()||!!S.code;}
 function hostHeaders(extra){var h={'x-booth-code':S.code,'x-booth-device':S.device};for(var k in extra)h[k]=extra[k];return h;}
 async function hostErr(r){
@@ -645,7 +650,7 @@ function syncForm(){
   $('optFacing').checked=S.facing;$('optSpeakA').checked=S.speakA;$('optSpeakB').checked=S.speakB;$('optOrig').checked=S.orig;
   $('sens').value=S.sens;$('sensOut').textContent=S.sens;
   $('pause').value=S.pause;$('pauseOut').textContent=(S.pause/1000).toFixed(1)+' s';
-  $('model').value=S.model;
+  $('model').value=S.model;$('engine').value=S.engine||'live';
 }
 function openSettings(){syncForm();try{$('settings').showModal();}catch(e){$('settings').setAttribute('open','');}}
 $('openSettings').onclick=openSettings;
@@ -657,19 +662,145 @@ $('selA').onchange=function(e){var v=e.target.value;v===S.B?setPair(v,S.A):setPa
 $('selB').onchange=function(e){var v=e.target.value;v===S.A?setPair(S.B,v):setPair(S.A,v);};
 $('swap').onclick=function(){setPair(S.B,S.A);};
 $('optFacing').onchange=function(e){S.facing=e.target.checked;save();renderLabels();};
-$('optSpeakA').onchange=function(e){S.speakA=e.target.checked;save();};
-$('optSpeakB').onchange=function(e){S.speakB=e.target.checked;save();};
+$('optSpeakA').onchange=function(e){S.speakA=e.target.checked;save();if(L.streams.a&&L.streams.a.audio)L.streams.a.audio.muted=!S.speakA;};
+$('optSpeakB').onchange=function(e){S.speakB=e.target.checked;save();if(L.streams.b&&L.streams.b.audio)L.streams.b.audio.muted=!S.speakB;};
 $('optOrig').onchange=function(e){S.orig=e.target.checked;save();renderPane('a');renderPane('b');};
 $('sens').oninput=function(e){S.sens=+e.target.value;$('sensOut').textContent=S.sens;save();};
 $('pause').oninput=function(e){S.pause=+e.target.value;$('pauseOut').textContent=(S.pause/1000).toFixed(1)+' s';save();};
 $('model').onchange=function(e){S.model=e.target.value;save();};
+$('engine').onchange=function(e){S.engine=e.target.value;save();};
 $('copyLog').onclick=async function(){
   var b=this;try{await navigator.clipboard.writeText(log.join('\n'));b.textContent='Copied';}catch(e){b.textContent='Copy blocked';}
   setTimeout(function(){b.textContent='Copy';},1500);
 };
 $('clearLog').onclick=function(){log=[];recent=[];feed={a:[],b:[]};$('log').textContent='Nothing yet.';renderPane('a');renderPane('b');};
 
-$('go').onclick=function(){running?stop():start();};
+
+/* ---------- live engine: GPT-Realtime-Translate, two streams on one microphone ----------
+   Stream "a" translates into your language (bottom half), stream "b" into theirs (top half).
+   Speech already in a stream's language is skipped by the model, so each person only gets
+   the other one's words. While a translated voice is playing, the microphone sends silence
+   so the booth never translates its own voice. */
+var LIVE_OUT=['es','pt','fr','ja','ru','zh','de','ko','hi','id','vi','it','en'];
+var L={on:false,starting:false,mic:null,streams:{},tick:null,gate:null,lastSpeech:0,idleTimer:null,seen:{}};
+function useLive(){return S.engine!=='classic'&&!ownKeys()&&!!S.code;}
+function liveSupported(){return LIVE_OUT.indexOf(S.A)>-1&&LIVE_OUT.indexOf(S.B)>-1&&!!window.RTCPeerConnection;}
+
+async function liveStart(){
+  if(L.on||L.starting)return;
+  if(!ready()){openSettings();setState('Add your access code first',true);return;}
+  if(!liveSupported()){setState('Live mode supports English, Russian, Spanish, German, French, Italian and a few more. Switch to Classic in settings for this pair',true);return;}
+  L.starting=true;unlockAudioOut();
+  $('go').classList.add('on');$('goText').textContent='Connecting';setState('Connecting');
+  try{
+    L.mic=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true,autoGainControl:true,channelCount:1}});
+  }catch(e){L.starting=false;$('go').classList.remove('on');$('goText').textContent='Start';setState('Microphone blocked. Allow it for this site in the browser settings, then tap Start',true);return;}
+  try{
+    var first=await liveTick(0);if(!first){L.starting=false;liveStop();return;}
+    await Promise.all([liveOpen('a',S.A),liveOpen('b',S.B)]);
+  }catch(e){L.starting=false;addLog('  ✕ '+e.message);liveStop(e.message);return;}
+  L.starting=false;L.on=true;running=true;L.lastSpeech=Date.now();
+  try{var ms=actx.createMediaStreamSource(L.mic);L.micAn=actx.createAnalyser();L.micAn.fftSize=512;ms.connect(L.micAn);}catch(e){}
+  wake();$('goText').textContent='Listening';setState('Listening. Talk normally, no need to pause');
+  addLog('• live session started ('+S.A+' ⇄ '+S.B+')');
+  L.tick=setInterval(function(){liveTick(30);},30000);
+  L.gate=setInterval(liveGate,60);
+  L.idleTimer=setInterval(function(){
+    if(L.on&&Date.now()-L.lastSpeech>120000)liveStop('Paused after 2 quiet minutes to save your minutes. Tap the mic to continue');
+  },5000);
+}
+
+async function liveOpen(side,lang){
+  var r=await netFetch('/api/session',{method:'POST',headers:hostHeaders({'content-type':'application/json'}),body:JSON.stringify({target:lang})},'the booth');
+  if(!r.ok){var he=await hostErr(r);if(he.usage)showMinutes(he.usage);throw new Error(he.msg);}
+  var sj=await r.json();if(sj.usage)showMinutes(sj.usage);
+  var pc=new RTCPeerConnection();
+  var track=side==='a'?L.mic.getAudioTracks()[0]:L.mic.getAudioTracks()[0].clone();
+  pc.addTrack(track,L.mic);
+  var st={side:side,lang:lang,pc:pc,track:track,audio:null,analyser:null,level:0,cur:null,input:'',lastDelta:0,finalizer:null};
+  L.streams[side]=st;
+  pc.ontrack=function(ev){
+    var el=new Audio();el.autoplay=true;el.playsInline=true;el.srcObject=ev.streams[0];
+    el.muted=!(side==='b'?S.speakB:S.speakA);
+    st.audio=el;try{el.play().catch(function(){});}catch(e){}
+    try{var src=actx.createMediaStreamSource(ev.streams[0]);var an=actx.createAnalyser();an.fftSize=512;src.connect(an);st.analyser=an;}catch(e){}
+  };
+  pc.onconnectionstatechange=function(){
+    if(!L.on)return;
+    if(pc.connectionState==='failed'||pc.connectionState==='disconnected'){addLog('  ✕ live stream '+lang+' '+pc.connectionState);liveStop('Connection lost. Tap the mic to reconnect');}
+  };
+  var dc=pc.createDataChannel('oai-events');
+  dc.onmessage=function(m){var ev;try{ev=JSON.parse(m.data);}catch(e){return;}liveEvent(st,ev);};
+  var offer=await pc.createOffer();await pc.setLocalDescription(offer);
+  var ans=await netFetch('https://api.openai.com/v1/realtime/translations/calls',{method:'POST',headers:{Authorization:'Bearer '+sj.value,'Content-Type':'application/sdp'},body:offer.sdp},'OpenAI');
+  if(!ans.ok){var t='';try{t=(await ans.text()).slice(0,140);}catch(e){}throw new Error('OpenAI live connection failed ('+ans.status+')'+(t?': '+t:''));}
+  await pc.setRemoteDescription({type:'answer',sdp:await ans.text()});
+}
+
+function liveEvent(st,ev){
+  var type=String(ev.type||'');
+  if(!L.seen[type]){L.seen[type]=1;addLog('  event: '+type);}
+  if(type.indexOf('error')>-1){var em=(ev.error&&(ev.error.message||ev.error.code))||'unknown';addLog('  ✕ '+st.lang+': '+em);setState('Live translation error: '+em,true);return;}
+  var delta=typeof ev.delta==='string'?ev.delta:(typeof ev.text==='string'&&type.indexOf('.done')<0?ev.text:'');
+  if(type.indexOf('input_transcript')>-1&&delta){st.input+=delta;L.lastSpeech=Date.now();return;}
+  if(type.indexOf('output_transcript')>-1&&delta){
+    L.lastSpeech=Date.now();
+    if(!st.cur){st.cur={text:'',orig:''};feed[st.side].push(st.cur);if(feed[st.side].length>4)feed[st.side].shift();}
+    st.cur.text+=delta;st.cur.orig=st.input.trim();st.lastDelta=Date.now();
+    renderPane(st.side);
+    clearTimeout(st.finalizer);st.finalizer=setTimeout(function(){liveFinalize(st);},1600);
+  }
+}
+function liveFinalize(st){
+  if(!st.cur)return;
+  var t=st.cur.text.trim();
+  if(t){addLog('['+(st.side==='a'?S.B:S.A)+' > '+st.lang+'] '+(st.cur.orig||'(heard)')+'\n    '+t);recent.push((st.cur.orig||'')+' => '+t);if(recent.length>8)recent.shift();}
+  st.cur=null;st.input='';
+  var other=L.streams[st.side==='a'?'b':'a'];if(other&&!other.cur)other.input='';
+}
+
+/* microphone gate: silence the mic while either translated voice is audible */
+var gateUntil=0,gateBuf=new Uint8Array(512);
+function liveGate(){
+  if(!L.on||!L.mic)return;
+  var loud=false;
+  ['a','b'].forEach(function(k){
+    var st=L.streams[k];if(!st||!st.analyser||!st.audio||st.audio.muted)return;
+    st.analyser.getByteTimeDomainData(gateBuf);var s=0;for(var i=0;i<gateBuf.length;i++){var v=(gateBuf[i]-128)/128;s+=v*v;}
+    if(Math.sqrt(s/gateBuf.length)>0.02)loud=true;
+  });
+  var now=Date.now();if(loud)gateUntil=now+350;
+  var open=now>gateUntil;
+  ['a','b'].forEach(function(k){var st=L.streams[k];if(st&&st.track&&st.track.enabled!==open)st.track.enabled=open;});
+  if(!open)setState('Speaking');else if($('state').textContent==='Speaking')setState('Listening');
+  /* level meter from the mic itself */
+  if(L.micAn){L.micAn.getByteTimeDomainData(gateBuf);var m=0;for(var j=0;j<gateBuf.length;j++){var w=(gateBuf[j]-128)/128;m+=w*w;}meter(Math.sqrt(m/gateBuf.length),0.01);}
+}
+
+async function liveTick(sec){
+  try{
+    var r=await netFetch('/api/tick',{method:'POST',headers:hostHeaders({'content-type':'application/json'}),body:JSON.stringify({seconds:sec})},'the booth');
+    var j={};try{j=await r.clone().json();}catch(e){}
+    if(r.ok){showMinutes(j);return true;}
+    var he=await hostErr(r);if(he.usage)showMinutes(he.usage);
+    if(L.on||L.starting)liveStop(he.msg);else setState(he.msg,true);
+    return false;
+  }catch(e){return true;}
+}
+
+function liveStop(msg){
+  var was=L.on;L.on=false;running=false;
+  clearInterval(L.tick);clearInterval(L.gate);clearInterval(L.idleTimer);
+  ['a','b'].forEach(function(k){var st=L.streams[k];if(!st)return;clearTimeout(st.finalizer);liveFinalize(st);
+    try{st.pc.close();}catch(e){}try{st.track.stop();}catch(e){}if(st.audio){try{st.audio.srcObject=null;}catch(e){}}});
+  L.streams={};
+  try{L.mic&&L.mic.getTracks().forEach(function(t){t.stop();});}catch(e){}L.mic=null;L.micAn=null;
+  releaseWake();$('go').classList.remove('on');$('goText').textContent='Start';$('lvl').style.width='0';$('go').style.setProperty('--lvl','0');
+  if(was)liveTick(0);
+  if(typeof msg==='string')setState(msg,true);else setState('Stopped');
+}
+
+$('go').onclick=function(){if(L.on||L.starting){liveStop();return;}if(running){stop();return;}if(useLive())liveStart();else start();};
 $('state').onclick=openSettings;$('state').style.cursor='pointer';$('state').title='Open settings and the step log';
 
 /* ---------- setup check ---------- */
