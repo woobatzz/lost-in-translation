@@ -697,8 +697,8 @@ $('selA').onchange=function(e){var v=e.target.value;v===S.B?setPair(v,S.A):setPa
 $('selB').onchange=function(e){var v=e.target.value;v===S.A?setPair(S.B,v):setPair(S.A,v);};
 $('swap').onclick=function(){setPair(S.B,S.A);};
 $('optFacing').onchange=function(e){S.facing=e.target.checked;save();renderLabels();};
-$('optSpeakA').onchange=function(e){S.speakA=e.target.checked;save();if(L.streams.a&&L.streams.a.audio)L.streams.a.audio.muted=!S.speakA;};
-$('optSpeakB').onchange=function(e){S.speakB=e.target.checked;save();if(L.streams.b&&L.streams.b.audio)L.streams.b.audio.muted=!S.speakB;};
+$('optSpeakA').onchange=function(e){S.speakA=e.target.checked;save();if(L.streams.a)liveVolume(L.streams.a);};
+$('optSpeakB').onchange=function(e){S.speakB=e.target.checked;save();if(L.streams.b)liveVolume(L.streams.b);};
 $('optOrig').onchange=function(e){S.orig=e.target.checked;save();renderPane('a');renderPane('b');};
 $('sens').oninput=function(e){S.sens=+e.target.value;$('sensOut').textContent=S.sens;save();};
 $('pause').oninput=function(e){S.pause=+e.target.value;$('pauseOut').textContent=(S.pause/1000).toFixed(1)+' s';save();};
@@ -752,13 +752,21 @@ async function liveOpen(side,lang){
   var pc=new RTCPeerConnection();
   var track=side==='a'?L.mic.getAudioTracks()[0]:L.mic.getAudioTracks()[0].clone();
   pc.addTrack(track,L.mic);
-  var st={side:side,lang:lang,pc:pc,track:track,audio:null,analyser:null,level:0,cur:null,input:'',lastDelta:0,finalizer:null};
+  var st={side:side,lang:lang,pc:pc,track:track,audio:null,analyser:null,gain:null,level:0,cur:null,input:'',pending:'',allow:null,utterStart:0,lastDelta:0,finalizer:null,decideTimer:null};
   L.streams[side]=st;
   pc.ontrack=function(ev){
-    var el=new Audio();el.autoplay=true;el.playsInline=true;el.srcObject=ev.streams[0];
-    el.muted=!(side==='b'?S.speakB:S.speakA);
+    /* The element only keeps the stream flowing. Sound goes through a short delay and a volume gate,
+       so the booth can decide whether a phrase is a real translation before anyone hears it. */
+    var el=new Audio();el.autoplay=true;el.playsInline=true;el.muted=true;el.srcObject=ev.streams[0];
     st.audio=el;try{el.play().catch(function(){});}catch(e){}
-    try{var src=actx.createMediaStreamSource(ev.streams[0]);var an=actx.createAnalyser();an.fftSize=512;src.connect(an);st.analyser=an;}catch(e){}
+    try{
+      var src=actx.createMediaStreamSource(ev.streams[0]);
+      var dl=actx.createDelay(1);dl.delayTime.value=0.4;
+      var g=actx.createGain();g.gain.value=0;
+      var an=actx.createAnalyser();an.fftSize=512;
+      src.connect(dl);dl.connect(g);g.connect(actx.destination);g.connect(an);
+      st.gain=g;st.analyser=an;liveVolume(st);
+    }catch(e){el.muted=!(side==='b'?S.speakB:S.speakA);addLog('  audio gate unavailable: '+e.message);}
   };
   pc.onconnectionstatechange=function(){
     if(!L.on)return;
@@ -772,23 +780,70 @@ async function liveOpen(side,lang){
   await pc.setRemoteDescription({type:'answer',sdp:await ans.text()});
 }
 
+/* ---- is this phrase a real translation, or the model repeating speech already in its language? ---- */
+var SCRIPT_OF={ru:'cyr',uk:'cyr',en:'lat',es:'lat',pt:'lat',fr:'lat',de:'lat',it:'lat',id:'lat',vi:'lat',ja:'jpn',zh:'han',ko:'kor',hi:'dev'};
+function scriptOf(t){
+  var c={cyr:(t.match(/[\u0400-\u04FF]/g)||[]).length,lat:(t.match(/[A-Za-z\u00C0-\u024F]/g)||[]).length,
+    jpn:(t.match(/[\u3040-\u30FF]/g)||[]).length,han:(t.match(/[\u4E00-\u9FFF]/g)||[]).length,kor:(t.match(/[\uAC00-\uD7AF]/g)||[]).length,dev:(t.match(/[\u0900-\u097F]/g)||[]).length};
+  var best='',n=0;for(var k in c)if(c[k]>n){n=c[k];best=k;}return n>=3?best:'';
+}
+function words(t){return (t.toLowerCase().match(/[\p{L}\p{N}']+/gu)||[]);}
+function overlap(a,b){var A=words(a),B=words(b);if(!A.length||!B.length)return 0;var set={};B.forEach(function(w){set[w]=1;});var hit=0;A.forEach(function(w){if(set[w])hit++;});return hit/A.length;}
+function sameLanguage(st,inp){
+  var s=scriptOf(inp),t=SCRIPT_OF[st.lang],other=SCRIPT_OF[st.side==='a'?S.B:S.A];
+  if(s&&t&&s!==t)return false;                      /* spoken in another script: a real translation */
+  if(s&&t&&s===t&&other&&other!==t)return true;      /* e.g. English heard by the into-English stream */
+  return overlap(st.pending,inp)>0.5;                /* same script both sides: compare the words */
+}
+function liveVolume(st){
+  if(!st.gain)return;
+  var want=st.allow===true&&(st.side==='b'?S.speakB:S.speakA)?1:0;
+  try{st.gain.gain.setTargetAtTime(want,actx.currentTime,0.03);}catch(e){st.gain.gain.value=want;}
+}
+function liveDecide(st){
+  if(st.allow!==null)return;
+  var other=L.streams[st.side==='a'?'b':'a'];
+  var inp=(st.input.trim()||(other?other.input.trim():''));
+  if(words(inp).length>=2)st.allow=!sameLanguage(st,inp);
+  else if(Date.now()-st.utterStart>1200)st.allow=true;
+  if(st.allow===null)return;
+  liveVolume(st);
+  if(st.allow===false){addLog('  skipped repeat in '+st.lang+': '+st.pending.trim().slice(0,60));st.skipped=true;}
+}
+
 function liveEvent(st,ev){
   var type=String(ev.type||'');
   if(!L.seen[type]){L.seen[type]=1;addLog('  event: '+type);}
   if(type.indexOf('error')>-1){var em=(ev.error&&(ev.error.message||ev.error.code))||'unknown';addLog('  ✕ '+st.lang+': '+em);setState('Live translation error: '+em,true);return;}
   var delta=typeof ev.delta==='string'?ev.delta:(typeof ev.text==='string'&&type.indexOf('.done')<0?ev.text:'');
-  if(type.indexOf('input_transcript')>-1&&delta){st.input+=delta;L.lastSpeech=Date.now();return;}
+  if(type.indexOf('input_transcript')>-1&&delta){
+    st.input+=delta;L.lastSpeech=Date.now();
+    if(st.allow===null&&st.pending){liveDecide(st);liveShow(st);}
+    return;
+  }
   if(type.indexOf('output_transcript')>-1&&delta){
     L.lastSpeech=Date.now();
-    var fresh=!st.cur;
-    if(fresh){st.cur={text:'',orig:'',live:true};feed[st.side].push(st.cur);if(feed[st.side].length>FEED_MAX)feed[st.side].shift();}
-    st.cur.text+=delta;st.cur.orig=st.input.trim();st.lastDelta=Date.now();
-    if(fresh)renderPane(st.side);else updateLive(st.side,st.cur);
+    if(!st.utterStart)st.utterStart=Date.now();
+    st.pending+=delta;st.lastDelta=Date.now();
+    liveDecide(st);liveShow(st);
     clearTimeout(st.finalizer);st.finalizer=setTimeout(function(){liveFinalize(st);},1600);
   }
 }
+/* show the caption only once the phrase is confirmed as a translation */
+function liveShow(st){
+  if(st.allow===null){clearTimeout(st.decideTimer);st.decideTimer=setTimeout(function(){liveDecide(st);liveShow(st);},250);return;}
+  if(st.allow!==true)return;
+  var fresh=!st.cur;
+  if(fresh){st.cur={text:'',orig:'',live:true};feed[st.side].push(st.cur);if(feed[st.side].length>FEED_MAX)feed[st.side].shift();}
+  st.cur.text=st.pending;st.cur.orig=st.input.trim();
+  if(fresh)renderPane(st.side);else updateLive(st.side,st.cur);
+}
 function liveFinalize(st){
-  if(!st.cur)return;
+  clearTimeout(st.decideTimer);
+  var was=st.cur;st.pending='';st.allow=null;st.utterStart=0;st.skipped=false;
+  /* let the delayed tail of the last translation finish before closing the gate */
+  clearTimeout(st.gainHold);st.gainHold=setTimeout(function(){if(st.allow===null)liveVolume(st);},1500);
+  if(!was){st.input='';return;}
   var t=st.cur.text.trim();
   if(t){addLog('['+(st.side==='a'?S.B:S.A)+' > '+st.lang+'] '+(st.cur.orig||'(heard)')+'\n    '+t);recent.push((st.cur.orig||'')+' => '+t);if(recent.length>8)recent.shift();}
   st.cur.live=false;var fs=st.side;st.cur=null;st.input='';renderPane(fs);
@@ -801,7 +856,7 @@ function liveGate(){
   if(!L.on||!L.mic)return;
   var loud=false;
   ['a','b'].forEach(function(k){
-    var st=L.streams[k];if(!st||!st.analyser||!st.audio||st.audio.muted)return;
+    var st=L.streams[k];if(!st||!st.analyser||(!st.gain&&(!st.audio||st.audio.muted)))return;
     st.analyser.getByteTimeDomainData(gateBuf);var s=0;for(var i=0;i<gateBuf.length;i++){var v=(gateBuf[i]-128)/128;s+=v*v;}
     if(Math.sqrt(s/gateBuf.length)>0.02)loud=true;
   });
